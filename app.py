@@ -1,60 +1,119 @@
+import pysqlite3
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
 import streamlit as st
-import time
+import chromadb
+from chromadb.utils import embedding_functions
+from google import genai
+import os
+from dotenv import load_dotenv
 
-# Import your two agent brains
-from retail_agent import ask_retail_agent
-from institutional_agent import ask_institutional_agent
+# --- SETUP ---
+load_dotenv()
+st.set_page_config(page_title="FinSight AI", layout="wide")
 
-# 1. Page Configuration
-st.set_page_config(page_title="Retail vs. Institutional AI", layout="wide")
+# Initialize Clients (Cached to prevent reloading on every click)
+@st.cache_resource
+def get_chroma_collection():
+    DB_PATH = "./chroma_db"
+    EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    client = chromadb.PersistentClient(path=DB_PATH)
+    ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
+    return client.get_collection(name="financial_knowledge", embedding_function=ef)
 
-# 2. Header
-st.title("🤖 Dual-Logic Investment Agent")
-st.markdown("""
-Compare how **Retail Investors** (Alfred Chen Style) and **Institutional Analysts** (HLIB Style) 
-answer the same financial question.
-""")
+@st.cache_resource
+def get_gemini_client():
+    api_key = os.environ.get("GEMINI_API_KEY")
+    return genai.Client(api_key=api_key)
 
-# 3. User Input
-user_question = st.text_input("Enter your question about the stock:", 
-                              placeholder="e.g., Should I buy this stock now?")
+collection = get_chroma_collection()
+client = get_gemini_client()
 
-# 4. The Magic Button
-if st.button("Analyze with Both Agents"):
-    if user_question:
-        # Create two columns side-by-side
-        col1, col2 = st.columns(2)
+# --- LOGIC ---
+def retrieve_filtered(query, source_type, n=5):
+    results = collection.query(
+        query_texts=[query],
+        n_results=n,
+        where={"source_type": source_type}
+    )
+    documents = results['documents'][0] if results['documents'] else []
+    metadatas = results['metadatas'][0] if results['metadatas'] else []
+    return documents, metadatas
 
-        # --- Left Column: Retail Agent ---
-        with col1:
-            st.subheader("🛍️ Retail Agent (Alfred)")
-            st.caption("Focus: Principles, Heuristics, Snowball Effect")
-            
-            with st.spinner("Thinking like a YouTuber..."):
-                # Call your actual retail script
-                retail_response = ask_retail_agent(user_question)
-                
-            st.success("Analysis Complete")
-            st.write(retail_response)
+def format_context_for_llm(documents):
+    return "\n".join([f"- {doc}" for doc in documents])
 
-        # --- Right Column: Institutional Agent ---
-        with col2:
-            st.subheader("🏛️ Institutional Agent (HLIB)")
-            st.caption("Focus: Valuation, Margins, Target Price")
-            
-            with st.spinner("Analyzing Financial Reports..."):
-                # Call your actual institutional script
-                inst_response = ask_institutional_agent(user_question)
-                
-            st.info("Report Generated")
-            st.write(inst_response)
-    else:
-        st.warning("Please enter a question first.")
+# --- UI LAYOUT ---
+st.title("🤖 FinSight: Dual-Source Financial Analysis")
+st.markdown("Compare **Institutional Reports** vs. **Retail Sentiment** instantly.")
 
-# 5. Sidebar (Optional Project Info)
+# Sidebar for controls
 with st.sidebar:
-    st.header("About This Project")
-    st.write("This tool demonstrates how LLMs can be prompted to reason differently based on source material.")
-    st.markdown("---")
-    st.write("Created by **Darryl Tan**")
-    st.write("FYP: Comparative Analysis of Investment Logics")
+    st.header("Configuration")
+    model_choice = st.selectbox("AI Model", ["gemini-3-flash-preview", "gemma-3-12b-it"])
+
+# Main Input
+query = st.text_input("Enter a financial question or topic (e.g., 'Inflation outlook'):")
+
+if st.button("Analyze") and query:
+    with st.spinner("🔍 Retrieving data from Vector DB..."):
+        # 1. Retrieve Data
+        inst_docs, inst_meta = retrieve_filtered(query, "institutional")
+        retail_docs, retail_meta = retrieve_filtered(query, "retail")
+        
+        inst_ctx = format_context_for_llm(inst_docs)
+        retail_ctx = format_context_for_llm(retail_docs)
+
+    # 2. Display Raw Sources (Expandable)
+    with st.expander("📂 View Retrieved Source Documents"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("🏛️ Institutional Sources")
+            if not inst_docs: st.write("No data found.")
+            for doc, meta in zip(inst_docs, inst_meta):
+                st.caption(f"📄 {meta.get('filename', 'Unknown')}")
+                st.text(doc[:150] + "...")
+        with col2:
+            st.subheader("🗣️ Retail Sources")
+            if not retail_docs: st.write("No data found.")
+            for doc, meta in zip(retail_docs, retail_meta):
+                st.caption(f"📄 {meta.get('filename', 'Unknown')}")
+                st.text(doc[:150] + "...")
+
+    # 3. Generate Answer
+    if not inst_docs and not retail_docs:
+        st.error("❌ No relevant data found in the database.")
+    else:
+        with st.spinner("🤖 Generating Analysis..."):
+            prompt = f"""
+            You are a Financial Analyst.
+            
+            USER QUERY: {query}
+            
+            ### INSTITUTIONAL DATA:
+            {inst_ctx}
+            
+            ### RETAIL DATA:
+            {retail_ctx}
+            
+            OUTPUT FORMAT:
+            ## 🏛️ Institutional Perspective
+            [Summary]
+            
+            ## 🗣️ Retail/Market Sentiment
+            [Summary]
+            
+            ## ⚖️ Divergence Analysis
+            [Comparison]
+            """
+            
+            try:
+                response = client.models.generate_content(
+                    model=model_choice,
+                    contents=prompt
+                )
+                st.markdown("---")
+                st.markdown(response.text)
+            except Exception as e:
+                st.error(f"Error communicating with Gemini: {e}")
