@@ -24,7 +24,7 @@ chroma_client = chromadb.PersistentClient(path=DB_PATH)
 ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
 collection = chroma_client.get_collection(name=COLLECTION_NAME, embedding_function=ef)
 
-def retrieve_filtered(query, source_type, n=5):
+def retrieve_filtered(query, source_type, n=15):
     """
     Retrieves context SPECIFICALLY for one source type.
     """
